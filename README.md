@@ -37,9 +37,23 @@ backend.
 |---|---|
 | Frame detection and cropping | works (tested on one 6-frame colour negative strip) |
 | 4000 dpi 14-bit RGB | works, ~1 min and 135 MB per frame |
-| Infrared (dust removal) | **not yet**: `coolscan3` doesn't offer it on the LS-50, and `coolscan2`'s infrared scan fails (scanner returns sense 05-2C-02). Work in progress in `ir/`. |
+| Infrared (dust removal) | works with our own USB driver `ir/ls50.py` (tested at 1000 dpi on one frame); not yet wired into `film_scan.py`. SANE can't do it: see `ir/PROTOCOL.md`. |
+
+## Infrared
+
+`ir/ls50.py` talks to the scanner directly over USB (pyusb on Homebrew's libusb) and
+reads the infrared channel together with RGB:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install pyusb
+.venv/bin/python ir/ls50.py scan --frame 3 --dpi 1000 --ir -o out/f3   # f3_rgb.pnm, f3_ir.pnm
+```
+
+16-bit PNM, raw. `--ir-exposure` sets the infrared exposure in ms (default 1.2;
+2.4 puts clear film at ~60% of full scale). The protocol is described in
+`ir/PROTOCOL.md`.
 
 ## License
 
 MIT. SANE itself is GPL; this project calls `scanimage` as a separate program and
-contains no SANE code.
+contains no SANE code. `ir/` is our own implementation of the scanner protocol.
