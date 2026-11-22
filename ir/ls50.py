@@ -3,10 +3,10 @@
 the infrared channel that SANE's coolscan2/coolscan3 backends do not deliver.
 
     ls50.py info                                  # inquiry: resolution, frames, focus range
-    ls50.py scan --frame 3 --dpi 1000 --ir -o out/f3   # out/f3_rgb.pnm + out/f3_ir.pnm
+    ls50.py scan --frame 3 --dpi 1000 --ir -o out/f3   # out/f3.tif + out/f3_ir.tif
 
-Output is 16-bit PNM (P6 RGB, P5 infrared), raw (not inverted), 14-bit data scaled to
-16 bits. See PROTOCOL.md for the command set. Needs pyusb and Homebrew's libusb; quit
+Output is uncompressed 16-bit TIFF (RGB, and infrared as grayscale), raw (not
+inverted), 14-bit data scaled to 16 bits. See PROTOCOL.md for the command set. Needs pyusb and Homebrew's libusb; quit
 VueScan first (it holds the USB connection).
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import usb.backend.libusb1
 import usb.core
 import usb.util
@@ -27,6 +28,9 @@ VENDOR, PRODUCT = 0x04B0, 0x4001
 EP_OUT, EP_IN = 0x01, 0x82
 PHASE_STATUS, PHASE_OUT, PHASE_IN = 0x01, 0x02, 0x03
 CHANNELS = {"r": 1, "g": 2, "b": 3, "ir": 9}       # window identifiers
+EXPOSURE_RGB = (120000, 120000, 100000)            # 10 ns units: 1.2/1.2/1.0 ms
+EXPOSURE_IR = 240000                               # 2.4 ms: clear base at ~60 % of range
+UNITS_PER_MM = 4000 / 25.4                         # offsets are in 1/4000 in
 VERBOSE = bool(os.environ.get("LS50_DEBUG"))
 
 
@@ -52,6 +56,10 @@ class Sense:
 
     def __str__(self) -> str:
         return f"{self.key:02x}-{self.asc:02x}-{self.ascq:02x}-{self.info:02x}"
+
+
+def mm_to_units(mm: float) -> int:
+    return round(mm * UNITS_PER_MM)
 
 
 def be(n: int, width: int) -> bytes:
@@ -219,34 +227,41 @@ class LS50:
         self.execute()
 
     # -- scanning --------------------------------------------------------------------
-    def scan(self, frame: int, dpi: int, ir: bool, exposure_rgb=(120000, 120000, 100000),
-             exposure_ir: int | None = None, focus: bool = True, bits: int = 14,
-             top: int = 0, height: int | None = None):
-        """Scan one holder slot. Returns (width, height, {channel: list of rows}),
-        each row a bytes object of 16-bit big-endian samples."""
+    def scan(self, frame: int, dpi: int, ir: bool, exposure_rgb=EXPOSURE_RGB,
+             exposure_ir: int | None = None, focus: bool = True,
+             top: int = 0, height: int | None = None, progress: bool = True):
+        """Scan one holder slot, optionally cropped along the strip (top/height in
+        1/4000 in from the top of the slot). Returns (rgb, ir): uint16 arrays of shape
+        (h, w, 3) and (h, w) (ir is None without infrared), 14-bit data scaled to 16."""
         info = self.info or self.inquiry()
         if not 1 <= frame <= max(info["frames"], 1):
             raise ScannerError(f"frame {frame} not sensed (holder reports {info['frames']})")
-        pitch = info["dpi_max"] // dpi
+        pitch = max(1, info["dpi_max"] // dpi)
         dpi = info["dpi_max"] // pitch
-        full_h = info["height"] - top if height is None else height
-        lw, lh = info["width"] // pitch, full_h // pitch
+        top = max(0, min(top, info["height"] - pitch))
+        full_h = info["height"] - top if height is None else min(height, info["height"] - top)
+        lw, lh = info["width"] // pitch, max(1, full_h // pitch)
         x0, y0 = 0, (frame - 1) * self.frame_pitch() + top
         chans = ["r", "g", "b"] + (["ir"] if ir else [])
         if exposure_ir is None:
-            exposure_ir = exposure_rgb[0]
+            exposure_ir = EXPOSURE_IR
 
         self.wait_ready()
         self.set_unit()
         self.set_boundaries()
+        # A focus operation (followed by execute) is what makes the strip adapter move
+        # the film to the frame: without one the scan starts while the strip is still
+        # being positioned, and the image comes out shifted/doubled.
         if focus:
             f = self.autofocus(x0 + lw * pitch // 2, y0 + lh * pitch // 2)
             log(f"autofocus -> {f}")
+        else:
+            self.set_focus(self.read_focus())
         self.wait_ready()
         for c in chans:
             self.send_identity_lut(CHANNELS[c])
         for c, e in zip(chans, list(exposure_rgb) + [exposure_ir]):
-            s = self.set_window(CHANNELS[c], dpi, x0, y0, lw * pitch, lh * pitch, bits, e)
+            s = self.set_window(CHANNELS[c], dpi, x0, y0, lw * pitch, lh * pitch, 14, e)
             if not s.ok:
                 raise ScannerError(f"set window for {c} rejected, sense {s}")
         ids = bytes(CHANNELS[c] for c in chans)
@@ -260,25 +275,29 @@ class LS50:
             raise ScannerError(f"scan command rejected, sense {s}")
 
         line = len(chans) * lw * 2
-        rows: dict[str, list[bytes]] = {c: [] for c in chans}
-        lines_per_read = int(os.environ.get("LS50_LINES_PER_READ", 0)) or \
-            max(1, (1 << 20) // (line + padding))
+        stride = line + padding
+        buf = bytearray(lh * stride)
+        per_read = int(os.environ.get("LS50_LINES_PER_READ", 0)) or max(1, (1 << 20) // stride)
         y = 0
         while y < lh:
-            n = min(lines_per_read, lh - y)
-            want = n * (line + padding)
+            n = min(per_read, lh - y)
             self.wait_ready()
-            data, s = self.command(bytes([0x28, 0, 0, 0, 0, 0]) + be(want, 3) + b"\0", n_in=want)
-            if not s.ok or len(data) != want:
-                raise ScannerError(f"read at line {y} failed: got {len(data)}/{want}, sense {s}")
-            for k in range(n):
-                off = k * (line + padding)
-                for i, c in enumerate(chans):
-                    rows[c].append(data[off + i * lw * 2: off + (i + 1) * lw * 2])
+            data, s = self.command(bytes([0x28, 0, 0, 0, 0, 0]) + be(n * stride, 3) + b"\0",
+                                   n_in=n * stride)
+            if not s.ok or len(data) != n * stride:
+                raise ScannerError(f"read at line {y} failed: got {len(data)}/{n * stride}, "
+                                   f"sense {s}")
+            buf[y * stride:(y + n) * stride] = data
             y += n
-            print(f"\r  line {y}/{lh}", end="", file=sys.stderr, flush=True)
-        print(file=sys.stderr)
-        return lw, lh, rows
+            if progress:
+                print(f"\r  line {y}/{lh}", end="", file=sys.stderr, flush=True)
+        if progress:
+            print(file=sys.stderr)
+        # each line: one plane per channel of lw big-endian samples, then padding
+        a = np.frombuffer(bytes(buf), dtype=">u2").reshape(lh, stride // 2)[:, :line // 2]
+        a = (a.reshape(lh, len(chans), lw).astype(np.uint16) << 2)
+        rgb = np.ascontiguousarray(a[:, :3].transpose(0, 2, 1))
+        return rgb, (np.ascontiguousarray(a[:, 3]) if ir else None)
 
     def block_padding(self) -> int:
         """After sense 09-80-06 to a scan command, the scanner states how many padding
@@ -291,31 +310,47 @@ class LS50:
         return pad
 
 
-def write_pnm(path: Path, w: int, h: int, planes: list[list[bytes]], shift: int) -> None:
-    """16-bit P5 (one plane) or P6 (three planes, interleaved per pixel)."""
-    import array
-    out = array.array("H")
-    for y in range(h):
-        rows = []
-        for p in planes:
-            a = array.array("H", p[y])
-            if sys.byteorder == "little":
-                a.byteswap()
-            rows.append(a)
-        if len(rows) == 1:
-            line = rows[0]
+def write_tiff(path: Path | str, img: np.ndarray, dpi: int) -> None:
+    """Uncompressed baseline TIFF, 16 bits per sample, little-endian: (h, w, 3) as RGB,
+    (h, w) as grayscale (black is zero). Pixels are written in strips of ~256 KB."""
+    img = np.ascontiguousarray(img, dtype="<u2")
+    h, w = img.shape[:2]
+    spp = 1 if img.ndim == 2 else img.shape[2]
+    row_bytes = w * spp * 2
+    rps = max(1, (256 << 10) // row_bytes)
+    counts = [min(rps, h - y) * row_bytes for y in range(0, h, rps)]
+    SHORT, LONG, RATIONAL = 3, 4, 5
+    # (tag, type, values); strip offsets are filled in once the layout is known
+    tags = [(256, LONG, [w]), (257, LONG, [h]), (258, SHORT, [16] * spp),
+            (259, SHORT, [1]), (262, SHORT, [2 if spp == 3 else 1]),
+            (273, LONG, [0] * len(counts)), (277, SHORT, [spp]), (278, LONG, [rps]),
+            (279, LONG, counts), (282, RATIONAL, [dpi]), (283, RATIONAL, [dpi]),
+            (284, SHORT, [1]), (296, SHORT, [2])]
+
+    def encode(typ, vals):
+        if typ == RATIONAL:
+            return b"".join(struct.pack("<II", v, 1) for v in vals)
+        return b"".join(struct.pack("<H" if typ == SHORT else "<I", v) for v in vals)
+
+    ifd_end = 8 + 2 + 12 * len(tags) + 4
+    extra_size = sum(len(d) + len(d) % 2 for d in (encode(t, v) for _, t, v in tags)
+                     if len(d) > 4)
+    pixels_at = ifd_end + extra_size
+    tags[5] = (273, LONG, [pixels_at + sum(counts[:i]) for i in range(len(counts))])
+    entries, extra = b"", b""
+    for tag, typ, vals in tags:
+        data = encode(typ, vals)
+        if len(data) <= 4:
+            field = data.ljust(4, b"\0")
         else:
-            line = array.array("H", bytes(2 * w * len(rows)))
-            for i, a in enumerate(rows):
-                line[i::len(rows)] = a
-        out.extend(line)
-    if shift:
-        out = array.array("H", (min(v << shift, 0xFFFF) for v in out))
-    if sys.byteorder == "little":
-        out.byteswap()
+            field = struct.pack("<I", ifd_end + len(extra))
+            extra += data + b"\0" * (len(data) % 2)
+        entries += struct.pack("<HHI", tag, typ, len(vals)) + field
+    assert ifd_end + len(extra) == pixels_at
     with open(path, "wb") as f:
-        f.write(f"P{'5' if len(planes) == 1 else '6'}\n{w} {h}\n65535\n".encode())
-        f.write(out.tobytes())
+        f.write(b"II*\0" + struct.pack("<I", 8) + struct.pack("<H", len(tags)) + entries
+                + b"\0\0\0\0" + extra)
+        f.write(img.tobytes())
 
 
 def main() -> None:
@@ -324,14 +359,19 @@ def main() -> None:
     sub.add_parser("info")
     sc = sub.add_parser("scan")
     sc.add_argument("--frame", type=int, default=1)
-    sc.add_argument("--dpi", type=int, default=1000)
+    sc.add_argument("--dpi", type=int, default=4000)
     sc.add_argument("--ir", action="store_true", help="also read the infrared channel")
+    sc.add_argument("--top", type=float, default=0.0,
+                    help="start this far into the slot along the strip (mm)")
+    sc.add_argument("--height", type=float, default=None,
+                    help="length to scan along the strip (mm; default: to the end of the slot)")
     sc.add_argument("--exposure", type=float, default=1.0,
                     help="scale the default RGB exposure (1.2/1.2/1.0 ms)")
-    sc.add_argument("--ir-exposure", type=float, default=None,
-                    help="infrared exposure in ms (default: same as red)")
+    sc.add_argument("--ir-exposure", type=float, default=EXPOSURE_IR / 1e5,
+                    help="infrared exposure in ms (default %(default)s)")
     sc.add_argument("--no-focus", action="store_true")
-    sc.add_argument("-o", "--out", type=Path, required=True, help="output prefix")
+    sc.add_argument("-o", "--out", type=Path, required=True,
+                    help="output prefix: <out>.tif (RGB) and <out>_ir.tif")
     args = ap.parse_args()
 
     s = LS50()
@@ -341,19 +381,17 @@ def main() -> None:
             for k, v in info.items():
                 print(f"{k:12} {v}")
             return
-        e = args.exposure
-        exp = (round(120000 * e), round(120000 * e), round(100000 * e))
-        exp_ir = None if args.ir_exposure is None else round(args.ir_exposure * 1e5)
-        w, h, rows = s.scan(args.frame, args.dpi, args.ir, exp, exp_ir, not args.no_focus)
+        exp = tuple(round(e * args.exposure) for e in EXPOSURE_RGB)
+        rgb, ir = s.scan(args.frame, args.dpi, args.ir, exp, round(args.ir_exposure * 1e5),
+                         not args.no_focus, top=mm_to_units(args.top),
+                         height=None if args.height is None else mm_to_units(args.height))
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        shift = 16 - 14
-        rgb = Path(f"{args.out}_rgb.pnm")
-        write_pnm(rgb, w, h, [rows["r"], rows["g"], rows["b"]], shift)
-        print(rgb)
-        if args.ir:
-            irp = Path(f"{args.out}_ir.pnm")
-            write_pnm(irp, w, h, [rows["ir"]], shift)
-            print(irp)
+        dpi = info["dpi_max"] // max(1, info["dpi_max"] // args.dpi)
+        write_tiff(f"{args.out}.tif", rgb, dpi)
+        print(f"{args.out}.tif")
+        if ir is not None:
+            write_tiff(f"{args.out}_ir.tif", ir, dpi)
+            print(f"{args.out}_ir.tif")
     except ScannerError as e:
         sys.exit(f"ls50: {e}")
     finally:

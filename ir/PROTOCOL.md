@@ -35,6 +35,7 @@ the error in the status, so check the sense of every command.
 | `E0 00 A0 00 00 00 00 00 09 00` + `00 x4 y4` | Autofocus at a point, then `C1` |
 | `E0 00 C1 00 00 00 00 00 09 00` + `00 focus4 00×4` | Set focus, then `C1` |
 | `C1 00 00 00 00 00` | Execute the preceding E0 operation |
+| `E0 00 D1 …` (load) | Refused on the SA-21 (05-24-00) |
 | `1B 00 00 00 n 00` + window ids | Start scan of the listed windows (`01 02 03` or `01 02 03 09`) |
 | `28 00 87 00 00 00 00 00 len 00` | Read scanner status page; bytes 19-20 = padding bytes per line |
 | `28 00 00 00 00 00 len3 00` | Read image data |
@@ -62,6 +63,15 @@ Channel (window) ids: 1 red, 2 green, 3 blue, 9 infrared.
 command block.** With `00` the LS-50 accepts the R/G/B windows but rejects window 9 with
 sense 05-24-00 (invalid field in command block), whatever the exposure. That is why
 SANE's coolscan2 fails (see below).
+
+## Strip positioning (SA-21)
+
+The strip adapter moves the film to a slot when a focus operation (set focus or
+autofocus, then execute) runs after the boundaries and before the scan. Start a scan
+without one and the film is still moving during the scan: the image comes out doubled
+or shifted. Once this left the feeder's idea of the strip position off by exactly 1500
+units (9.5 mm) for every slot, also as seen by SANE, until the strip was reinserted.
+The driver therefore always sends a focus operation before scanning.
 
 ## Data
 
