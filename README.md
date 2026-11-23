@@ -33,6 +33,10 @@ slot. Output:
   scale in the infrared; dust and scratches are dark specks. Colour dyes leave a faint
   (5-10 %) ghost of the picture. `--ir-separate` writes the infrared to its own
   `neg_<roll>_NNNN_ir.tif` instead; `merge_ir.py DIR` merges such pairs into RGBI.
+- Each frame is then trimmed at full resolution (`crop.py`): the holder mask at the sides
+  and its rounded window corners at the slot end, found in the infrared (or, without
+  it, the colours) where the opaque mask reads near zero, and the last sliver of the
+  gap at the top. `--no-trim` keeps the full scan; `crop.py DIR` trims earlier scans.
 - `.previews/NNNN/frameN.tif` and `neg_<roll>_NNNN_plan.json` with the crop of every frame
 
 Frame numbers continue across strips: each scan starts after the highest

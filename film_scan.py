@@ -34,6 +34,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent / "ir"))
 from ls50 import EXPOSURE_RGB, LS50, ScannerError, write_tiff  # noqa: E402
 
+from crop import find_crop  # noqa: E402
+
 WINDOW_MM = 37.8333              # scan window along the strip (5958 pel at 4000 dpi)
 FRAME_MM = 36.0
 PREVIEW_DPI = 400
@@ -136,7 +138,8 @@ def next_number(out: Path, roll: str) -> int:
 
 
 def scan(scanner: LS50, plan: list[dict], out: Path, roll: str, first: int, ir: bool,
-         exposure: float, ir_exposure_ms: float | None, ir_separate: bool = False) -> None:
+         exposure: float, ir_exposure_ms: float | None, ir_separate: bool = False,
+         trim: bool = True) -> None:
     exp = tuple(round(e * exposure) for e in EXPOSURE_RGB)
     exp_ir = None if ir_exposure_ms is None else round(ir_exposure_ms * 1e5)
     for p in plan:
@@ -145,6 +148,11 @@ def scan(scanner: LS50, plan: list[dict], out: Path, roll: str, first: int, ir: 
         rgb, irimg = scanner.scan(p["frame"], 4000, ir, exp, exp_ir, focus=True,
                                   top=round(p["top_mm"] * PEL_PER_MM),
                                   height=round((p["bottom_mm"] - p["top_mm"]) * PEL_PER_MM))
+        if trim:
+            full = rgb if irimg is None else np.dstack([rgb, irimg])
+            t, b, l, r = find_crop(full)
+            rgb = rgb[t:b, l:r]
+            irimg = None if irimg is None else irimg[t:b, l:r]
         if irimg is not None and not ir_separate:
             write_tiff(out / f"{stem}.tif", np.dstack([rgb, irimg]), 4000)
             what = f"{stem}.tif (RGBI)"
@@ -180,6 +188,8 @@ def main() -> None:
     sc.add_argument("--exposure", type=float, default=1.0)
     sc.add_argument("--ir-exposure", type=float, default=None,
                     help="infrared exposure in ms (default 2.4)")
+    sc.add_argument("--no-trim", dest="trim", action="store_false",
+                    help="keep the holder mask and gap edge (see crop.py)")
     sc.add_argument("--calibrate-only", action="store_true",
                     help="write the previews and plan, scan nothing")
     args = ap.parse_args()
@@ -211,7 +221,7 @@ def main() -> None:
             (out / f"neg_{args.roll}_{first:04d}_plan.json").write_text(json.dumps(plan, indent=1))
             if not args.calibrate_only:
                 scan(scanner, plan, out, args.roll, first, args.ir, args.exposure,
-                     args.ir_exposure, args.ir_separate)
+                     args.ir_exposure, args.ir_separate, args.trim)
             print(f"done in {time.monotonic() - t0:.0f} s")
     except ScannerError as e:
         sys.exit(f"film_scan: {e}")
