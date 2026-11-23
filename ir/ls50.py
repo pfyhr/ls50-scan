@@ -312,7 +312,9 @@ class LS50:
 
 def write_tiff(path: Path | str, img: np.ndarray, dpi: int) -> None:
     """Uncompressed baseline TIFF, 16 bits per sample, little-endian: (h, w, 3) as RGB,
-    (h, w) as grayscale (black is zero). Pixels are written in strips of ~256 KB."""
+    (h, w, 4) as RGB plus one unspecified extra sample (RGBI: infrared in the fourth
+    channel, 64 bits per pixel), (h, w) as grayscale (black is zero). Pixels are written
+    in strips of ~256 KB."""
     img = np.ascontiguousarray(img, dtype="<u2")
     h, w = img.shape[:2]
     spp = 1 if img.ndim == 2 else img.shape[2]
@@ -322,10 +324,12 @@ def write_tiff(path: Path | str, img: np.ndarray, dpi: int) -> None:
     SHORT, LONG, RATIONAL = 3, 4, 5
     # (tag, type, values); strip offsets are filled in once the layout is known
     tags = [(256, LONG, [w]), (257, LONG, [h]), (258, SHORT, [16] * spp),
-            (259, SHORT, [1]), (262, SHORT, [2 if spp == 3 else 1]),
+            (259, SHORT, [1]), (262, SHORT, [2 if spp >= 3 else 1]),
             (273, LONG, [0] * len(counts)), (277, SHORT, [spp]), (278, LONG, [rps]),
             (279, LONG, counts), (282, RATIONAL, [dpi]), (283, RATIONAL, [dpi]),
             (284, SHORT, [1]), (296, SHORT, [2])]
+    if spp == 4:
+        tags.append((338, SHORT, [0]))  # ExtraSamples: unspecified (infrared)
 
     def encode(typ, vals):
         if typ == RATIONAL:

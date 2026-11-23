@@ -1,2 +1,3 @@
 pyusb
 numpy
+tifffile  # merge_ir.py only

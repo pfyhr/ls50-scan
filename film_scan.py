@@ -129,20 +129,32 @@ def calibrate(scanner: LS50, save_previews: Path | None = None) -> list[dict]:
     return plan
 
 
-def scan(scanner: LS50, plan: list[dict], out: Path, roll: str, ir: bool, exposure: float,
-         ir_exposure_ms: float | None) -> None:
+def next_number(out: Path, roll: str) -> int:
+    """Number for the first frame of this strip: one past the highest neg_<roll>_NNNN.tif in out."""
+    nums = [int(f.stem.split("_")[-1]) for f in out.glob(f"neg_{roll}_[0-9][0-9][0-9][0-9].tif")]
+    return max(nums, default=0) + 1
+
+
+def scan(scanner: LS50, plan: list[dict], out: Path, roll: str, first: int, ir: bool,
+         exposure: float, ir_exposure_ms: float | None, ir_separate: bool = False) -> None:
     exp = tuple(round(e * exposure) for e in EXPOSURE_RGB)
     exp_ir = None if ir_exposure_ms is None else round(ir_exposure_ms * 1e5)
     for p in plan:
-        stem = f"neg_{roll}_{p['frame']:04d}"
+        stem = f"neg_{roll}_{first + p['frame'] - 1:04d}"
         t0 = time.monotonic()
         rgb, irimg = scanner.scan(p["frame"], 4000, ir, exp, exp_ir, focus=True,
                                   top=round(p["top_mm"] * PEL_PER_MM),
                                   height=round((p["bottom_mm"] - p["top_mm"]) * PEL_PER_MM))
-        write_tiff(out / f"{stem}.tif", rgb, 4000)
-        if irimg is not None:
-            write_tiff(out / f"{stem}_ir.tif", irimg, 4000)
-        print(f"frame {p['frame']}: {stem}.tif{f' + {stem}_ir.tif' if ir else ''} "
+        if irimg is not None and not ir_separate:
+            write_tiff(out / f"{stem}.tif", np.dstack([rgb, irimg]), 4000)
+            what = f"{stem}.tif (RGBI)"
+        else:
+            write_tiff(out / f"{stem}.tif", rgb, 4000)
+            what = f"{stem}.tif"
+            if irimg is not None:
+                write_tiff(out / f"{stem}_ir.tif", irimg, 4000)
+                what += f" + {stem}_ir.tif"
+        print(f"frame {p['frame']}: {what} "
               f"({rgb.shape[1]}x{rgb.shape[0]}, {time.monotonic() - t0:.0f} s)")
 
 
@@ -158,8 +170,13 @@ def main() -> None:
     sc = sub.add_parser("scan")
     sc.add_argument("--roll", required=True)
     sc.add_argument("--out", type=Path, required=True)
+    sc.add_argument("--first", type=int, default=None,
+                    help="number of the strip's first frame (default: continue after the "
+                         "highest neg_<roll>_NNNN.tif already in --out)")
     sc.add_argument("--ir", "--infrared", dest="ir", action="store_true",
-                    help="also write each frame's infrared channel (_ir.tif)")
+                    help="also scan infrared, written as the fourth channel (RGBI, 64-bit TIFF)")
+    sc.add_argument("--ir-separate", action="store_true",
+                    help="with --ir: write infrared to its own _ir.tif instead")
     sc.add_argument("--exposure", type=float, default=1.0)
     sc.add_argument("--ir-exposure", type=float, default=None,
                     help="infrared exposure in ms (default 2.4)")
@@ -188,10 +205,13 @@ def main() -> None:
             out = args.out.expanduser()
             out.mkdir(parents=True, exist_ok=True)
             t0 = time.monotonic()
-            plan = calibrate(scanner, out / ".previews")
-            (out / f"neg_{args.roll}_plan.json").write_text(json.dumps(plan, indent=1))
+            first = args.first if args.first is not None else next_number(out, args.roll)
+            print(f"strip starts at frame {first:04d}")
+            plan = calibrate(scanner, out / ".previews" / f"{first:04d}")
+            (out / f"neg_{args.roll}_{first:04d}_plan.json").write_text(json.dumps(plan, indent=1))
             if not args.calibrate_only:
-                scan(scanner, plan, out, args.roll, args.ir, args.exposure, args.ir_exposure)
+                scan(scanner, plan, out, args.roll, first, args.ir, args.exposure,
+                     args.ir_exposure, args.ir_separate)
             print(f"done in {time.monotonic() - t0:.0f} s")
     except ScannerError as e:
         sys.exit(f"film_scan: {e}")
